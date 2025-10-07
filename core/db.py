@@ -1,5 +1,24 @@
+import os
 import streamlit as st
 import psycopg, psycopg.rows
+
+FRIENDLY_MISSING_SECRETS = """
+❌ Não foi possível conectar ao banco.
+
+Configure os segredos do Streamlit com suas credenciais do Supabase:
+
+[db]
+# Opção 1 (recomendada): URL completa (pooling 6543)
+url = "postgresql://USER:PASSWORD@HOST:6543/postgres?sslmode=require"
+
+# Opção 2: campos separados
+host = "HOST.supabase.co"         # ou aws-0-...pooler.supabase.com
+port = 6543                       # pooling = 6543  |  direct = 5432
+dbname = "postgres"
+user = "postgres.xxxxx"
+password = "SUA-SENHA"
+sslmode = "require"
+"""
 
 class Db:
     def __init__(self):
@@ -7,15 +26,39 @@ class Db:
 
     @st.cache_resource(show_spinner=False)
     def get_conn(_self):
+        # Prefer DATABASE_URL env, then st.secrets["db"]["url"], else discrete fields
+        env_url = os.getenv("DATABASE_URL")
         cfg = st.secrets.get("db", {})
-        conn = psycopg.connect(
-            host=cfg.get("host", "localhost"),
-            port=cfg.get("port", 5432),
-            dbname=cfg.get("dbname", "postgres"),
-            user=cfg.get("user", "postgres"),
-            password=cfg.get("password", "postgres"),
-            row_factory=psycopg.rows.dict_row,
-        )
+        url = env_url or cfg.get("url")
+
+        try:
+            if url:
+                # Ensure sslmode=require if not present
+                if "sslmode" not in url:
+                    url = (url + ("&" if "?" in url else "?") + "sslmode=require")
+                conn = psycopg.connect(url, row_factory=psycopg.rows.dict_row)
+            else:
+                host = cfg.get("host")
+                port = int(cfg.get("port", 0)) if cfg.get("port") else None
+                dbname = cfg.get("dbname")
+                user = cfg.get("user")
+                password = cfg.get("password")
+                sslmode = cfg.get("sslmode", "require")
+
+                # Friendly guard
+                if not all([host, port, dbname, user, password]):
+                    st.error(FRIENDLY_MISSING_SECRETS)
+                    st.stop()
+
+                conn = psycopg.connect(
+                    host=host, port=port, dbname=dbname, user=user, password=password,
+                    row_factory=psycopg.rows.dict_row, sslmode=sslmode
+                )
+        except Exception as e:
+            st.error(FRIENDLY_MISSING_SECRETS)
+            st.exception(e)
+            st.stop()
+
         return conn
 
     def qall(self, sql, params=None):
@@ -34,9 +77,14 @@ class Db:
             conn.commit()
             return cur.rowcount
 
-    # Schemas "injetados" conforme seu app atual
+    # ---------- Schemas ----------
     def ensure_schema_agenda(self):
-        self.qexec("create extension if not exists pgcrypto;")
+        # pgcrypto pode já estar habilitado no Supabase. Ignorar erros.
+        try:
+            self.qexec("create extension if not exists pgcrypto;")
+        except Exception:
+            pass
+
         self.qexec("""
         create table if not exists agenda (
           id uuid primary key default gen_random_uuid(),
@@ -56,7 +104,11 @@ class Db:
         """)
 
     def ensure_schema_reiki_series(self):
-        self.qexec("create extension if not exists pgcrypto;")
+        try:
+            self.qexec("create extension if not exists pgcrypto;")
+        except Exception:
+            pass
+
         self.qexec("""
         create table if not exists reiki_cromo_agenda (
           "ID" uuid primary key default gen_random_uuid(),
@@ -76,24 +128,39 @@ class Db:
           "TERAPIA"       text not null default 'REIKI'
         );
         """)
-        # Drop antigos constraints de terça se existirem (mantendo lógica no serviço)
+        # Remover constraints antigas opcionais (sem falhar)
+        for c in ('rca_tuesday_data','rca_tuesday_d1','rca_tuesday_d2','rca_tuesday_d3'):
+            try:
+                self.qexec(f'ALTER TABLE reiki_cromo_agenda DROP CONSTRAINT IF EXISTS {c};')
+            except Exception:
+                pass
+
+    def ensure_auth_schema(self):
         try:
-            self.qexec('ALTER TABLE reiki_cromo_agenda DROP CONSTRAINT IF EXISTS rca_tuesday_data;')
-            self.qexec('ALTER TABLE reiki_cromo_agenda DROP CONSTRAINT IF EXISTS rca_tuesday_d1;')
-            self.qexec('ALTER TABLE reiki_cromo_agenda DROP CONSTRAINT IF EXISTS rca_tuesday_d2;')
-            self.qexec('ALTER TABLE reiki_cromo_agenda DROP CONSTRAINT IF EXISTS rca_tuesday_d3;')
+            self.qexec("create extension if not exists pgcrypto;")
         except Exception:
             pass
 
-    def ensure_auth_schema(self):
-        self.qexec("create extension if not exists pgcrypto;")
+        # Garantir tabela users antes de índice/alter
         self.qexec("""
-        CREATE UNIQUE INDEX IF NOT EXISTS users_email_ci_unique ON users (lower(email));
-        """)
-        self.qexec("""
-        ALTER TABLE users
-          ADD COLUMN IF NOT EXISTS password_hash       text,
-          ADD COLUMN IF NOT EXISTS password_updated_at timestamptz,
-          ADD COLUMN IF NOT EXISTS failed_logins       integer NOT NULL DEFAULT 0,
-          ADD COLUMN IF NOT EXISTS locked_until        timestamptz;
-        """)
+        create table if not exists users (
+            id bigserial primary key,
+            email text unique not null,
+            nome  text,
+            entidade text,
+            perfil text default 'user',
+            ativo boolean default true,
+            password_hash text,
+            password_updated_at timestamptz,
+            failed_logins integer not null default 0,
+            locked_until timestamptz
+        );
+        """ )
+
+        # Índice de e-mail case-insensitive
+        try:
+            self.qexec("""
+            CREATE UNIQUE INDEX IF NOT EXISTS users_email_ci_unique ON users (lower(email));
+            """)
+        except Exception:
+            pass
